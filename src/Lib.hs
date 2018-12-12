@@ -2,10 +2,6 @@
 
 module Lib where
 
-import           Control.Applicative            ( (<$>)
-                                                , (<*>)
-                                                )
-import qualified Data.ByteString               as B
 import qualified Data.ByteString.Lazy          as BL
 import           Data.Csv
 import qualified Data.Vector                   as V
@@ -14,10 +10,7 @@ import           Text.Regex
 import           System.IO
 import           Data.List.Split
 import           GHC.Generics                   ( Generic )
-import           Data.Maybe                     ( fromMaybe
-                                                , fromJust
-                                                )
--- import qualified Codec.Text.IConv as IConv
+import           Data.Maybe                     ( fromMaybe )
 
 data Postcode = Postcode
     { jis :: !String
@@ -36,7 +29,7 @@ data Postcode = Postcode
     , updated :: !Int
     , updateReason :: !Int
     }
-    deriving (Generic, Show)
+    deriving (Generic, Show, Eq)
 
 instance FromRecord Postcode
 instance ToRecord Postcode
@@ -63,11 +56,11 @@ regexFloor = "（([０-９]+階)）"
 regexFloorKana :: String
 regexFloorKana = "\\(([0-9]+ｶｲ)\\)"
 
-regexReplace :: String
-regexReplace = "^([^０-９第（]+)[第]*[０-９]+地割.*"
+regexJiwari :: String
+regexJiwari = "^([^０-９第（]+)[第]*[０-９]+地割.*"
 
-regexReplaceKana :: String
-regexReplaceKana = "^([^0-9\\(]+)(ﾀﾞｲ)*[0-9]*ﾁﾜﾘ.*"
+regexJiwariKana :: String
+regexJiwariKana = "^([^0-9\\(]+)(ﾀﾞｲ)*[0-9]*ﾁﾜﾘ.*"
 
 regexUseInParentheses :: String
 regexUseInParentheses = "[０-９]+区"
@@ -77,29 +70,27 @@ regexUseInParenthesesKana = "[0-9]+ｸ"
 
 regexIgnoreInParentheses :: String
 regexIgnoreInParentheses =
-    "[０-９]|^その他$|^丁目$|^番地$|^地階・階層不明$|[０-９]*地割|成田国際空港内|次のビルを除く"
-
-regexIgnoreInParenthesesKana :: String
-regexIgnoreInParenthesesKana = "ｿﾉﾀ|[0-9]*ﾁﾜﾘ|ﾊﾞｯｶｲ"
+    "[０-９]|^その他$|^丁目$|^番地$|^地階・階層不明$|[０-９]*地割|成田国際空港内|次のビルを除く|^全域$"
 
 convert :: FilePath -> FilePath -> IO ()
 convert input output = do
     csvData <- BL.readFile input
-    -- csvData' <- return $ IConv.convert "CP932" "UTF-8" csvData
     BL.writeFile output BL.empty
     case decode NoHeader csvData of
-        Left  err -> putStrLn err
-        Right v   -> V.foldM_ (convert' output) (V.head v) v
+        Left err -> putStrLn err
+        Right records ->
+            V.foldM_ (convert' output) (V.head records, Nothing) records
 
-convert' :: FilePath -> Postcode -> Postcode -> IO Postcode
-convert' output last current
-    | isUnCloseLast && isUnCloseNext = return $ current
-        { townArea     = townArea next
-        , townAreaKana = townAreaKana next
-        }
-    | isUnCloseLast = writeAndReturn next
-    | isUnCloseCurrent = return current
-    | otherwise = writeAndReturn current
+convert'
+    :: FilePath
+    -> (Postcode, Maybe Postcode)
+    -> Postcode
+    -> IO (Postcode, Maybe Postcode)
+convert' output (last, lastChanged) current
+    | isUnClose last && isUnClose next = return (next, lastChanged)
+    | isUnClose last                   = writeAndReturn next
+    | isUnClose current                = return (current, lastChanged)
+    | otherwise                        = writeAndReturn current
   where
     next = current
         { townArea     = townArea last ++ townArea current
@@ -107,58 +98,70 @@ convert' output last current
             townAreaKana last
                 ++ (if isUnCloseKana last then townAreaKana current else "")
         }
-    isUnCloseLast    = isUnClose last
-    isUnCloseCurrent = isUnClose current
-    isUnCloseNext    = isUnClose next
     isUnClose p = townArea p =~ regexUnClosedParentheses :: Bool
     isUnCloseKana p = townAreaKana p =~ regexUnClosedParenthesesKana :: Bool
+    targetToWrite = filter isDup . postCodeWithTownArea
+    isDup p = maybe True (not . isSameAddress p) lastChanged
     writeAndReturn p = do
-        write p
-        return p
-    write = BL.appendFile output . encode . postCodeWithTownArea
+        targets <- return $ targetToWrite p
+        write targets
+        return (p, nextLastChanged targets)
+    write = BL.appendFile output . encode
+    isSamePostcode p =
+        maybe False (\lp -> postcode lp == postcode p) lastChanged
+    nextLastChanged ps | null ps                  = lastChanged
+                       | isSamePostcode $ head ps = lastChanged
+                       | otherwise                = Just $ head ps
+
+isSameAddress :: Postcode -> Postcode -> Bool
+isSameAddress p p' = all (\f -> f p == f p') fields
+  where
+    fields =
+        [ postcode
+        , prefectureKana
+        , cityKana
+        , townAreaKana
+        , prefecture
+        , city
+        , townArea
+        ]
+
 
 postCodeWithTownArea :: Postcode -> [Postcode]
-postCodeWithTownArea p = case convertTownArea p of
-    Just tas ->
-        map (\(ta, taKana) -> p { townArea = ta, townAreaKana = taKana }) tas
-    Nothing -> [p { townArea = "", townAreaKana = "" }]
+postCodeWithTownArea p =
+    map (\(ta, taKana) -> p { townArea = ta, townAreaKana = taKana })
+        $ convertTownArea p
 
-convertTownArea :: Postcode -> Maybe [(String, String)]
+convertTownArea :: Postcode -> [(String, String)]
 convertTownArea p
     | ta =~ regexIgnore
-    = Nothing
+    = [("", "")]
     | ta =~ regexFloor
-    = Just [(replace regexFloor ta "　\\1", replace regexFloorKana taKana "\\1")]
-    | ta =~ regexReplace
-    = Just
-        [(replace regexReplace ta "\\1", replace regexReplaceKana taKana "\\1")]
+    = [(replace regexFloor ta "　\\1", replace regexFloorKana taKana "\\1")]
+    | ta =~ regexJiwari
+    = [(replace regexJiwari ta "\\1", replace regexJiwariKana taKana "\\1")]
     | ta =~ regexParentheses
-    = Just
-        $  [(replaceParentheses "", replaceParenthesesKana "")]
-        ++ ( map
-                   (\(ta, taKana) ->
-                       (replaceParentheses ta, replaceParenthesesKana taKana)
-                   )
-           $ convertInParentheses p
-           )
+    = [(replaceParentheses "", replaceParenthesesKana "")] ++ converAndReplace p
     | otherwise
-    = Just [(ta, taKana)]
+    = [(ta, taKana)]
   where
-    ta                     = townArea p
-    taKana                 = townAreaKana p
+    ta               = townArea p
+    taKana           = townAreaKana p
+    converAndReplace = map replaceParentheses' . convertInParentheses
+    replaceParentheses' (ta', taKana') =
+        (replaceParentheses ta', replaceParenthesesKana taKana')
     replaceParentheses     = replace regexParentheses ta
     replaceParenthesesKana = replace regexParenthesesKana taKana
     replace regex = subRegex (mkRegex regex)
 
 
 convertInParentheses :: Postcode -> [(String, String)]
-convertInParentheses p =
-    filter
-            (\(s, _) -> (s =~ regexUseInParentheses)
-                || not (s =~ regexIgnoreInParentheses)
-            )
-        $ zip (splitInParentheses ta) (splitInParenthesesKana taKana)
+convertInParentheses p = filter shouldUse
+    $ zip (splitInParentheses ta) (splitInParenthesesKana taKana)
   where
+    shouldUse :: (String, String) -> Bool
+    shouldUse (s, _) =
+        s =~ regexUseInParentheses || not (s =~ regexIgnoreInParentheses)
     ta     = townArea p
     taKana = townAreaKana p
 
@@ -179,9 +182,3 @@ matchParenthesesKana = matchParentheses' regexParenthesesKana
 
 matchParentheses' :: String -> String -> Maybe String
 matchParentheses' regex = fmap head . matchRegex (mkRegex regex)
-
-test :: String -> String -> Bool
-test str regex = str =~ regex
-
-replaceTest :: String -> String -> String
-replaceTest str regex = subRegex (mkRegex regex) str "　\\1"
