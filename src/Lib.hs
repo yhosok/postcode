@@ -10,7 +10,7 @@ import           Text.Regex
 import           System.IO
 import           Data.List.Split
 import           GHC.Generics                   ( Generic )
-import           Data.Maybe                     ( fromMaybe )
+import           Data.Maybe                     ( fromJust )
 
 data Postcode = Postcode
     { jis :: !String
@@ -33,7 +33,6 @@ data Postcode = Postcode
 
 instance FromRecord Postcode
 instance ToRecord Postcode
-instance ToNamedRecord Postcode
 
 regexIgnore :: String
 regexIgnore = "以下に掲載がない場合|(市|町|村)の次に番地がくる場合|(市|町|村)一円"
@@ -77,41 +76,37 @@ convert input output = do
     csvData <- BL.readFile input
     BL.writeFile output BL.empty
     case decode NoHeader csvData of
-        Left err -> putStrLn err
-        Right records ->
-            V.foldM_ (convert' output) (V.head records, Nothing) records
+        Left  err     -> putStrLn err
+        Right records -> V.foldM_ (convert' output) (Nothing, Nothing) records
 
 convert'
     :: FilePath
-    -> (Postcode, Maybe Postcode)
+    -> (Maybe Postcode, Maybe Postcode)
     -> Postcode
-    -> IO (Postcode, Maybe Postcode)
-convert' output (last, lastChanged) current
-    | isUnClose last && isUnClose next = return (next, lastChanged)
-    | isUnClose last                   = writeAndReturn next
-    | isUnClose current                = return (current, lastChanged)
-    | otherwise                        = writeAndReturn current
+    -> IO (Maybe Postcode, Maybe Postcode)
+convert' output (lastUnClosed, lastChanged) current 
+    | isUnClosed target = return (Just target, lastChanged)
+    | otherwise = write targetToWrite >> return (Nothing, nextLastChanged)
   where
-    next = current
-        { townArea     = townArea last ++ townArea current
-        , townAreaKana =
-            townAreaKana last
-                ++ (if isUnCloseKana last then townAreaKana current else "")
+    target = maybe current (const merged) lastUnClosed
+    merged = current
+        { townArea = (townArea . fromJust $ lastUnClosed) ++ townArea current
+        , townAreaKana = (townAreaKana . fromJust $ lastUnClosed)
+                             ++ nextUnClosedKana
         }
-    isUnClose p = townArea p =~ regexUnClosedParentheses :: Bool
-    isUnCloseKana p = townAreaKana p =~ regexUnClosedParenthesesKana :: Bool
-    targetToWrite = filter isDup . postCodeWithTownArea
-    isDup p = maybe True (not . isSameAddress p) lastChanged
-    writeAndReturn p = do
-        targets <- return $ targetToWrite p
-        write targets
-        return (p, nextLastChanged targets)
+    targetToWrite = filter isNotDup $ postCodeWithTownArea target
+    isNotDup p = maybe True (not . isSameAddress p) lastChanged
+    nextUnClosedKana
+        | isUnClosedKana . fromJust $ lastUnClosed = townAreaKana current
+        | otherwise                               = ""
+    isUnClosed p = townArea p =~ regexUnClosedParentheses :: Bool
+    isUnClosedKana p = townAreaKana p =~ regexUnClosedParenthesesKana :: Bool
     write = BL.appendFile output . encode
     isSamePostcode p =
         maybe False (\lp -> postcode lp == postcode p) lastChanged
-    nextLastChanged ps | null ps                  = lastChanged
-                       | isSamePostcode $ head ps = lastChanged
-                       | otherwise                = Just $ head ps
+    nextLastChanged | null targetToWrite = lastChanged
+                    | isSamePostcode $ head targetToWrite = lastChanged
+                    | otherwise = Just $ head targetToWrite
 
 isSameAddress :: Postcode -> Postcode -> Bool
 isSameAddress p p' = all (\f -> f p == f p') fields
@@ -125,7 +120,6 @@ isSameAddress p p' = all (\f -> f p == f p') fields
         , city
         , townArea
         ]
-
 
 postCodeWithTownArea :: Postcode -> [Postcode]
 postCodeWithTownArea p =
